@@ -1,21 +1,26 @@
 /**
- * Records a casual click-through of the EcoPuntos app: one continuous take,
- * no captions, no title cards. Approximates a hand recording:
+ * Records a click-through of the EcoPuntos app: one continuous take, no
+ * captions, no title cards. Driver ported from the MoodBox demo technique:
  *
- * - an on-page cursor follows every mouse move (headless video captures no
- *   OS pointer, so without this the clicks come from nowhere),
- * - curved eased mouse paths with occasional overshoot,
- * - scrolling in many small ticks with hesitations, like a wheel finger,
- * - irregular typing rhythm, hover-before-click, idle drift while "reading".
+ * - dot cursor injected via addInitScript, position persisted across pages
+ *   in sessionStorage so it never snaps back to the corner,
+ * - every click is show (smooth scrollIntoView, centered) → 18-step mouse
+ *   move → click → pause,
+ * - all scrolling is native smooth scrollBy/scrollIntoView (renders as one
+ *   continuous motion on video, unlike wheel ticks),
+ * - fixed unhurried pauses instead of random jitter.
  *
  * Dev-only utility: reuses the machine's Playwright + cached Chromium, neither
- * of which is a project dependency (see record-demo.mjs header).
+ * of which is a project dependency. Record against the production server:
  *
+ *   npm run build && (npm start -- --port 3000 &)
  *   node scripts/record-casual.mjs
  *
  * Env: BASE_URL (default http://localhost:3000), OUT_DIR (default demo-out),
  * PW_CORE (absolute path to a playwright-core install).
- * Writes OUT_DIR/raw/casual-<ts>.webm.
+ * Writes OUT_DIR/raw/casual-<ts>.webm; encode with:
+ *   ffmpeg -i <raw> -c:v libx264 -preset slow -crf 20 -pix_fmt yuv420p \
+ *     -movflags +faststart docs/demo.mp4
  */
 import { mkdirSync } from "node:fs";
 import { createRequire } from "node:module";
@@ -33,207 +38,117 @@ const CHROME =
 
 mkdirSync(`${OUT}/raw`, { recursive: true });
 
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-const rnd = (min, max) => min + Math.random() * (max - min);
-const pick = (arr) => arr[Math.floor(Math.random() * arr.length)];
-
 const browser = await chromium.launch({
   executablePath: CHROME,
   args: ["--no-sandbox", "--disable-dev-shm-usage"],
 });
-const ctx = await browser.newContext({
+const context = await browser.newContext({
   viewport: { width: 1440, height: 900 },
   recordVideo: { dir: `${OUT}/raw`, size: { width: 1440, height: 900 } },
 });
 
-// Visible cursor + mouse tracker on every page, before any content loads.
-await ctx.addInitScript(() => {
-  const el = document.createElement("div");
-  el.id = "__cursor";
-  el.innerHTML =
-    '<svg width="20" height="20" viewBox="0 0 24 24"><path d="M6 3.5 19.5 12l-7.6 1.4L8.5 21z" fill="#fff" stroke="#1e293b" stroke-width="1.6" stroke-linejoin="round"/></svg>';
-  el.style.cssText = [
-    "position:fixed", "left:0", "top:0", "z-index:2147483647",
-    "pointer-events:none", "filter:drop-shadow(0 1px 2px rgba(2,6,23,.45))",
-  ].join(";");
-  const move = (x, y) => {
-    window.__mouse = { x, y };
-    el.style.transform = `translate(${x - 1}px,${y - 1}px) scale(${window.__pressed ? 0.88 : 1})`;
-  };
-  window.addEventListener("mousemove", (e) => move(e.clientX, e.clientY));
-  window.addEventListener("mousedown", () => { window.__pressed = true; });
-  window.addEventListener("mouseup", () => { window.__pressed = false; });
-  const put = () => document.body && document.body.appendChild(el);
-  if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", put);
-  else put();
-  window.__mouse = { x: 700, y: 620 };
+// Visible cursor so viewers can follow the clicks.
+await context.addInitScript(() => {
+  addEventListener("DOMContentLoaded", () => {
+    const c = document.createElement("div");
+    c.style.cssText =
+      "position:fixed;left:-40px;top:-40px;width:22px;height:22px;margin:-11px 0 0 -11px;border-radius:50%;background:rgba(5,150,105,.55);border:2px solid #fff;box-shadow:0 2px 8px rgba(0,0,0,.25);z-index:2147483647;pointer-events:none;transition:transform .12s";
+    document.body.appendChild(c);
+    const saved = sessionStorage.getItem("cursor");
+    if (saved) {
+      const [x, y] = saved.split(",");
+      c.style.left = x + "px";
+      c.style.top = y + "px";
+    }
+    addEventListener(
+      "mousemove",
+      (e) => {
+        c.style.left = e.clientX + "px";
+        c.style.top = e.clientY + "px";
+        sessionStorage.setItem("cursor", `${e.clientX},${e.clientY}`);
+      },
+      true
+    );
+    addEventListener("mousedown", () => (c.style.transform = "scale(.7)"), true);
+    addEventListener("mouseup", () => (c.style.transform = "scale(1)"), true);
+  });
 });
 
-const p = await ctx.newPage();
-const video = p.video();
-const mousePos = async () =>
-  p.evaluate(() => window.__mouse ?? { x: 700, y: 620 });
+const page = await context.newPage();
+const video = page.video();
+const wait = (ms) => page.waitForTimeout(ms);
 
-// Curved, eased path with occasional overshoot past the target.
-async function glideTo(x, y) {
-  const { x: sx, y: sy } = await mousePos();
-  const dx = x - sx, dy = y - sy;
-  const dist = Math.hypot(dx, dy);
-  if (dist < 3) return;
-  const steps = Math.max(12, Math.min(32, Math.round(dist / 38)));
-  const nx = -dy / dist, ny = dx / dist; // perpendicular
-  const bend = rnd(-0.16, 0.16) * dist;
-  const cx = sx + dx / 2 + nx * bend, cy = sy + dy / 2 + ny * bend;
-  const quad = (t) => ({
-    x: (1 - t) * (1 - t) * sx + 2 * (1 - t) * t * cx + t * t * x,
-    y: (1 - t) * (1 - t) * sy + 2 * (1 - t) * t * cy + t * t * y,
-  });
-  for (let i = 1; i <= steps; i++) {
-    const t = i / steps;
-    const e = t < 0.75 ? 1 - Math.pow(1 - t / 0.75, 2) * 0.25 : 0.75 + (t - 0.75); // ease-out then settle
-    const pt = quad(Math.min(1, e));
-    await p.mouse.move(pt.x, pt.y);
-    await sleep(rnd(6, 14));
-  }
-  if (Math.random() < 0.45) {
-    // overshoot a few px and drift back, like a real hand correcting
-    await p.mouse.move(x + rnd(-7, 7), y + rnd(-7, 7));
-    await sleep(rnd(30, 70));
-    await p.mouse.move(x, y);
-  } else {
-    await p.mouse.move(x, y);
-  }
+async function show(loc) {
+  await loc.evaluate((e) => e.scrollIntoView({ behavior: "smooth", block: "center" }));
+  await wait(700);
+}
+async function click(loc, { force = false, pause = 600 } = {}) {
+  await show(loc);
+  const b = await loc.boundingBox();
+  const x = b.x + b.width / 2, y = b.y + b.height / 2;
+  await page.mouse.move(x, y, { steps: 18 });
+  await wait(200);
+  await loc.click({ force });
+  await wait(pause);
+}
+async function type(loc, text) {
+  await click(loc, { pause: 200 });
+  await loc.pressSequentially(text, { delay: 38 });
+  await wait(400);
+}
+async function scrollBy(y) {
+  await page.evaluate((dy) => scrollBy({ top: dy, behavior: "smooth" }), y);
+  await wait(1100);
 }
 
-// Scroll in stages until the element is on screen, like reaching for it.
-async function ensureVisible(locator) {
-  for (let i = 0; i < 14; i++) {
-    const box = await locator.boundingBox();
-    if (!box) throw new Error("ensureVisible: element has no box");
-    const vh = await p.evaluate(() => window.innerHeight);
-    if (box.y >= 100 && box.y + box.height <= vh - 20) return box;
-    const delta = box.y < 100 ? box.y - 150 : box.y - vh + 170;
-    await scrollBy(Math.max(-520, Math.min(520, delta)));
-    await sleep(rnd(150, 350));
-  }
-  const box = await locator.boundingBox();
-  if (!box) throw new Error("ensureVisible: element has no box");
-  return box;
-}
+// 1. Login
+await page.goto(`${BASE}/login`, { waitUntil: "networkidle" });
+await wait(1800);
+await type(page.locator("#email"), "demo@ecopuntos.app");
+await type(page.locator("#password"), "demo1234");
+await click(page.locator('form button:has-text("Entrar")'), { pause: 300 });
 
-async function humanClick(locator) {
-  const box = await ensureVisible(locator);
-  await glideTo(box.x + box.width * rnd(0.3, 0.7), box.y + box.height * rnd(0.3, 0.7));
-  await sleep(rnd(180, 480)); // hover, deciding
-  await p.mouse.down();
-  await sleep(rnd(70, 140));
-  await p.mouse.up();
-}
+// 2. Dashboard — look around
+await page.waitForURL("**/dashboard");
+await wait(2200);
+await scrollBy(650);
+await wait(1400);
+await scrollBy(500);
+await wait(1800);
+await scrollBy(-450);
+await wait(1200);
 
-async function humanType(locator, text) {
-  await humanClick(locator);
-  await sleep(rnd(200, 450));
-  for (const ch of text) {
-    await p.keyboard.type(ch);
-    await sleep(Math.random() < 0.12 ? rnd(180, 320) : rnd(28, 95));
-  }
-}
+// 3. Deposit — pick Vidrio with the keyboard, set qty, confirm
+await click(page.locator("#material"), { pause: 300 });
+await page.keyboard.press("ArrowDown");
+await wait(450);
+await page.keyboard.press("ArrowDown");
+await wait(650);
+await page.keyboard.press("Tab");
+await wait(300);
+await click(page.locator("#qty"), { pause: 200 });
+await page.keyboard.press("ControlOrMeta+a");
+await page.locator("#qty").pressSequentially("2", { delay: 90 });
+await wait(1600); // reading the live preview
+await click(page.locator('form button:has-text("Confirmar depósito")'), { pause: 2400 });
 
-// Wheel scrolling the way a finger does: bursts of small ticks, hesitations.
-async function scrollBy(total) {
-  let left = total;
-  while (Math.abs(left) > 10) {
-    const tick = Math.sign(left) * Math.min(Math.abs(left), rnd(35, 90));
-    await p.mouse.wheel(0, tick);
-    left -= tick;
-    await sleep(Math.random() < 0.18 ? rnd(120, 260) : rnd(25, 60));
-  }
-}
-
-// Idle drift while "reading": tiny movements, cursor stays roughly put.
-async function read(ms) {
-  const end = Date.now() + ms;
-  while (Date.now() < end) {
-    const { x, y } = await mousePos();
-    await p.mouse.move(x + rnd(-9, 9), y + rnd(-7, 7));
-    await sleep(rnd(220, 520));
-  }
-}
-
-const centerOf = async (locator, xRatio = 0.5) => {
-  const box = await locator.boundingBox();
-  return { x: box.x + box.width * xRatio, y: box.y + box.height / 2 };
-};
-
-// ======================= the take =======================
-await p.goto(`${BASE}/login`, { waitUntil: "networkidle" });
-await read(2100);
-
-await humanType(p.locator("#email"), "demo@ecopuntos.app");
-await sleep(rnd(300, 600));
-await humanType(p.locator("#password"), "demo1234");
-await sleep(rnd(500, 900));
-await humanClick(p.locator('form button:has-text("Entrar")'));
-await p.waitForURL("**/dashboard");
-await read(2400);
-
-// look around: drift down the page in bursts, hover the charts
-await scrollBy(620);
-await read(1700);
-const bars = p.locator("text=Puntos por mes").first();
-try {
-  const { x, y } = await centerOf(bars);
-  await glideTo(x + 120, y + 90); // sweep across the bars like reading them
-  await sleep(rnd(500, 900));
-  await glideTo(x + 260, y + 60);
-} catch { /* keep going, it's a vibe not a test */ }
-await read(1200);
-await scrollBy(480);
-await read(2100);
-await scrollBy(-260); // scroll back up a touch, re-reading
-await read(1400);
-
-// deposit: focus the select, arrow down to Vidrio (3rd option), tab on
-await humanClick(p.locator("#material"));
-await sleep(rnd(300, 600));
-await p.keyboard.press("ArrowDown");
-await sleep(rnd(350, 650));
-await p.keyboard.press("ArrowDown");
-await sleep(rnd(500, 900));
-await p.keyboard.press("Tab");
-await humanClick(p.locator("#qty"));
-await p.keyboard.press("ControlOrMeta+a");
-await sleep(rnd(150, 300));
-for (const ch of "2") {
-  await p.keyboard.type(ch);
-  await sleep(rnd(60, 140));
-}
-await read(1900); // looking at the live preview
-await humanClick(p.locator('form button:has-text("Confirmar depósito")'));
-await read(2800);
-
-// go browse the rewards
-await humanClick(p.locator("nav.hidden a:has-text('Recompensas')"));
-await p.waitForFunction(() => location.pathname === "/rewards"); // client-side nav: no load event
-await read(2000);
+// 4. Rewards — browse and redeem the bus pass
+await click(page.locator("nav.hidden a:has-text('Recompensas')"), { pause: 1500 });
+await page.waitForFunction(() => location.pathname === "/rewards"); // client-side nav
+await wait(1800);
 await scrollBy(320);
-await read(1500);
-const cards = p.locator('button:has-text("Canjear")');
-await glideTo(...Object.values(await centerOf(cards.first(), 0.2)));
-await read(900);
-await humanClick(cards.first());
-await read(3000);
+await wait(1400);
+await click(page.locator('button:has-text("Canjear")').first(), { pause: 2600 });
 
-// back to the panel, last look around
-await humanClick(p.locator("nav.hidden a:has-text('Panel')"));
-await p.waitForFunction(() => location.pathname === "/dashboard"); // client-side nav: no load event
-await read(1800);
+// 5. Back to the panel, last look
+await click(page.locator("nav.hidden a:has-text('Panel')"), { pause: 1500 });
+await page.waitForFunction(() => location.pathname === "/dashboard"); // client-side nav
+await wait(1800);
 await scrollBy(420);
-await read(1500);
-await scrollBy(-180);
-await glideTo(rnd(900, 1150), rnd(500, 700)); // park the cursor somewhere neutral
-await read(900);
+await wait(1600);
+await scrollBy(-220);
+await wait(1200);
 
-await ctx.close();
+await context.close();
 await browser.close();
 console.log(JSON.stringify({ raw: await video.path() }));
