@@ -101,9 +101,22 @@ async function scrollBy(y) {
   await wait(1100);
 }
 
-// 1. Login
-await page.goto(`${BASE}/login`, { waitUntil: "networkidle" });
-await wait(1800);
+// 1. Landing — read the idea first, then enter
+await page.goto(`${BASE}/`, { waitUntil: "networkidle" });
+await wait(2200);
+await scrollBy(680);
+await wait(1500);
+await scrollBy(640);
+await wait(1500);
+await scrollBy(660);
+await wait(1900);
+await scrollBy(-1980);
+await wait(1300);
+await click(page.getByRole("link", { name: "Probar el dashboard" }), { pause: 400 });
+
+// 2. Login
+await page.waitForURL("**/login");
+await wait(1200);
 await type(page.locator("#email"), "demo@ecopuntos.app");
 await type(page.locator("#password"), "demo1234");
 await click(page.locator('form button:has-text("Entrar")'), { pause: 300 });
